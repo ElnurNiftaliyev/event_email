@@ -27,32 +27,36 @@ async function sendEmails() {
     const { count: last24hCount } = await supabase.from('email_events').select('*', { count: 'exact', head: true }).eq('user_id', email.user_id).gte('created_at', DateTime.now().minus({ hours: 24 }).toISO());
     if (last24hCount ?? 0 > 0) continue;
 
-    // Idempotency: same template in 48h
-    const { count: last48hCount } = await supabase.from('email_events').select('*', { count: 'exact', head: true }).eq('user_id', email.user_id).eq('meta->>template', email.template_key).gte('created_at', DateTime.now().minus({ hours: 48 }).toISO());
-    if (last48hCount ?? 0 > 0) continue;
+    // Idempotency check
+    const { count: recentCount } = await supabase.from('email_queue').select('*', { count: 'exact', head: true }).eq('user_id', email.user_id).eq('template_key', email.template_key).gte('created_at', DateTime.now().minus({ hours: 48 }).toISO());
+    if (recentCount ?? 0 > 1) continue;
 
-    // Render template
     const { data: template } = await supabase.from('email_templates').select().eq('key', email.template_key).single();
-    const html = template.html.replace('{{name}}', user.full_name || 'there');
-    const subject = email.variant ? 'Variant B subject' : template.subject;  // Handle A/B
+    const subject = template.subject.replace('{{name}}', user.full_name);
+    const html = template.html.replace('{{name}}', user.full_name);
 
-    // Send
     try {
-      const { data: sendData, error: sendError } = await resend.emails.send({ from: 'no-reply@creatorx.ai', to: user.email, subject, html, headers: { 'List-Unsubscribe': '<unsub-url>' } });
-      if (sendError) throw sendError;
+      await resend.emails.send({
+        from: 'CreatorX <noreply@creatorx.ai>',
+        to: user.email,
+        subject,
+        html,
+        headers: {
+          'List-Unsubscribe': `<https://acme.com/email/preferences?u=${user.id}>`,
+        },
+      });
       await supabase.from('email_queue').update({ status: 'sent' }).eq('id', email.id);
-      await supabase.from('email_events').insert({ user_id: email.user_id, type: 'sent', provider_id: sendData?.id });
-    } catch (err) {
-      const attempts = email.attempts + 1;
-      if (attempts >= 5) {
+    } catch (e) {
+      const newAttempts = (email.attempts || 0) + 1;
+      if (newAttempts >= 5) {
         await supabase.from('email_queue').update({ status: 'failed' }).eq('id', email.id);
       } else {
-        const backoff = isDemo ? 5 : Math.pow(2, attempts) * 60;  // seconds
-        const newSend = DateTime.now().plus({ seconds: backoff }).toISO();
-        await supabase.from('email_queue').update({ send_after: newSend, attempts }).eq('id', email.id);
+        const delay = isDemo ? 5 : 60;
+        const send_after = DateTime.now().plus({ seconds: delay * Math.pow(2, newAttempts) }).toISO();
+        await supabase.from('email_queue').update({ attempts: newAttempts, send_after }).eq('id', email.id);
       }
     }
   }
 }
 
-cron.schedule(isDemo ? '*/10 * * * * *' : '*/1 * * * *', sendEmails);  // Every 1 min, or faster in demo
+cron.schedule(isDemo ? '*/10 * * * * *' : '*/5 * * * *', sendEmails);
